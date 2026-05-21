@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # You might need the following imports. Feel free to change it if you opt for different libraries.
 
 import os
@@ -13,7 +15,7 @@ from openai import OpenAI
 # Default configs
 DEFAULT_DATA_DIR = "data"
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-DEFAULT_LLM_MODEL = "gpt-4.1-mini"
+DEFAULT_LLM_MODEL = "llama3.2"
 DEFAULT_CHUNK_SIZE = 256
 DEFAULT_CHUNK_OVERLAP = 32
 DEFAULT_TOP_K = 4
@@ -70,7 +72,28 @@ def load_documents(data_dir: str = DEFAULT_DATA_DIR) -> list[Document]:
     as `page_content` and includes metadata for the source file path and
     document type.
     """
-    pass
+    documents: list[Document] = []
+    folder_types = ["emails", "notes", "sms", "calendar"]
+
+    for doc_type in folder_types:
+        folder_path = os.path.join(data_dir, doc_type)
+        pattern = os.path.join(folder_path, "*.txt")
+
+        for file_path in sorted(globmod.glob(pattern)):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "source": file_path,
+                        "type": doc_type,
+                    },
+                )
+            )
+
+    return documents
 
 
 def split_documents(
@@ -83,7 +106,11 @@ def split_documents(
     The resulting chunked Document objects use the configured chunk size and
     overlap while preserving the original document metadata.
     """
-    pass
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    return splitter.split_documents(docs)
 
 
 def build_index(
@@ -95,7 +122,18 @@ def build_index(
     The index contains normalized float32 embeddings generated from each
     chunk's text with the provided embedding model.
     """
-    pass
+    texts = [chunk.page_content for chunk in chunks]
+    embeddings = embedding_model.encode(texts, convert_to_numpy=True)
+    embeddings = embeddings.astype(np.float32)
+
+    # Normalizar para que inner product == cosine similarity
+    faiss.normalize_L2(embeddings)
+
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dimension)
+    index.add(embeddings)
+
+    return index
 
 
 def retrieve(
@@ -110,10 +148,32 @@ def retrieve(
     Results are ordered by similarity and include the chunk text, similarity
     score, and metadata for each matching chunk.
     """
-    pass
+    query_embedding = model.encode([query], convert_to_numpy=True).astype(np.float32)
+    faiss.normalize_L2(query_embedding)
+
+    scores, indices = index.search(query_embedding, k)
+
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx == -1:
+            continue
+        results.append({
+            "text": chunks[idx].page_content,
+            "score": float(score),
+            "metadata": chunks[idx].metadata,
+        })
+
+    return results
 
 
-SYSTEM_PROMPT = ""
+SYSTEM_PROMPT = (
+    "You are a personal digital assistant. You answer questions based ONLY on the "
+    "context retrieved from the user's personal documents (emails, notes, SMS, and calendar). "
+    "If the provided context does not contain enough information to answer the question, "
+    "say that you don't have relevant information in your documents. "
+    "Never fabricate information that is not in the context. "
+    "Answer in the same language the user writes in."
+)
 
 
 class Assistant:
@@ -148,7 +208,44 @@ class Assistant:
         conversation messages, and the system prompt. The assistant response is
         appended to history alongside the user message.
         """
-        pass
+        k = k or self.top_k
+
+        # Recuperar chunks relevantes
+        results = retrieve(question, self.index, self.model, self.chunks, k)
+
+        # Construir bloque de contexto
+        if results:
+            context_parts = []
+            for i, r in enumerate(results, 1):
+                source = r["metadata"].get("source", "unknown")
+                doc_type = r["metadata"].get("type", "unknown")
+                context_parts.append(
+                    f"[Document {i} | type={doc_type} | source={source}]\n{r['text']}"
+                )
+            context_block = "\n\n".join(context_parts)
+        else:
+            context_block = "No relevant documents found."
+
+        # Construir mensajes para el LLM
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(self.history)
+        messages.append({
+            "role": "user",
+            "content": f"Context:\n{context_block}\n\nQuestion: {question}",
+        })
+
+        # Llamar al LLM
+        response = self.client.chat.completions.create(
+            model=self.llm_model,
+            messages=messages,
+        )
+        answer = response.choices[0].message.content
+
+        # Guardar en historial
+        self.history.append({"role": "user", "content": question})
+        self.history.append({"role": "assistant", "content": answer})
+
+        return answer
 
     def clear_history(self) -> None:
         """Empties the conversation history."""

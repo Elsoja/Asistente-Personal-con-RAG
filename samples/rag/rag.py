@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-# You might need the following imports. Feel free to change it if you opt for different libraries.
-
 import os
+import re
 import glob as globmod
 from typing import Any
 import numpy as np
@@ -19,6 +18,17 @@ DEFAULT_LLM_MODEL = "llama3.2"
 DEFAULT_CHUNK_SIZE = 256
 DEFAULT_CHUNK_OVERLAP = 32
 DEFAULT_TOP_K = 4
+OVERFETCH_MULTIPLIER = 3
+
+
+TAG_TO_TYPE = {
+    "/email": "emails",
+    "/emails": "emails",
+    "/notes": "notes",
+    "/note": "notes",
+    "/sms": "sms",
+    "/calendar": "calendar",
+}
 
 
 def _parse_int_setting(name: str, value: Any) -> int:
@@ -126,7 +136,6 @@ def build_index(
     embeddings = embedding_model.encode(texts, convert_to_numpy=True)
     embeddings = embeddings.astype(np.float32)
 
-    # Normalizar para que inner product == cosine similarity
     faiss.normalize_L2(embeddings)
 
     dimension = embeddings.shape[1]
@@ -136,34 +145,84 @@ def build_index(
     return index
 
 
+def parse_type_filters(question: str) -> tuple[str, list[str]]:
+
+    found_types: list[str] = []
+    clean_question = question
+
+    for tag, doc_type in TAG_TO_TYPE.items():
+        pattern = re.compile(re.escape(tag), re.IGNORECASE)
+        if pattern.search(clean_question):
+            if doc_type not in found_types:
+                found_types.append(doc_type)
+            clean_question = pattern.sub("", clean_question)
+
+    clean_question = re.sub(r"\s+", " ", clean_question).strip()
+    return clean_question, found_types
+
+
+def expand_query(question: str, client: OpenAI, model: str) -> list[str]:
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Generate 3 alternative phrasings of this question for semantic search. "
+                "Return only the questions, one per line.\n\n"
+                f"Question: {question}"
+            ),
+        }],
+    )
+    raw = response.choices[0].message.content.strip()
+    variants = [line.strip() for line in raw.split("\n") if line.strip()]
+    return [question] + variants
+
+
 def retrieve(
         query: str,
         index: faiss.IndexFlatIP,
         model: SentenceTransformer,
         chunks: list[Document],
         k: int = DEFAULT_TOP_K,
+        type_filter: list[str] | None = None,
+        expanded_queries: list[str] | None = None,
 ) -> list[dict]:
     """Gets the most relevant chunks for a query.
 
     Results are ordered by similarity and include the chunk text, similarity
     score, and metadata for each matching chunk.
     """
-    query_embedding = model.encode([query], convert_to_numpy=True).astype(np.float32)
-    faiss.normalize_L2(query_embedding)
+    queries = expanded_queries if expanded_queries else [query]
 
-    scores, indices = index.search(query_embedding, k)
+    fetch_k = k * OVERFETCH_MULTIPLIER if type_filter else k
 
-    results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
-            continue
-        results.append({
-            "text": chunks[idx].page_content,
-            "score": float(score),
-            "metadata": chunks[idx].metadata,
-        })
+    seen_indices: set[int] = set()
+    all_results: list[dict] = []
 
-    return results
+    for q in queries:
+        q_embedding = model.encode([q], convert_to_numpy=True).astype(np.float32)
+        faiss.normalize_L2(q_embedding)
+
+        scores, indices = index.search(q_embedding, fetch_k)
+
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1 or idx in seen_indices:
+                continue
+            seen_indices.add(idx)
+
+            chunk_type = chunks[idx].metadata.get("type", "")
+            if type_filter and chunk_type not in type_filter:
+                continue
+
+            all_results.append({
+                "text": chunks[idx].page_content,
+                "score": float(score),
+                "metadata": chunks[idx].metadata,
+            })
+
+    all_results.sort(key=lambda r: r["score"], reverse=True)
+    return all_results[:k]
 
 
 SYSTEM_PROMPT = (
@@ -210,10 +269,20 @@ class Assistant:
         """
         k = k or self.top_k
 
-        # Recuperar chunks relevantes
-        results = retrieve(question, self.index, self.model, self.chunks, k)
+        clean_question, type_filter = parse_type_filters(question)
 
-        # Construir bloque de contexto
+        expanded = expand_query(clean_question, self.client, self.llm_model)
+
+        results = retrieve(
+            clean_question,
+            self.index,
+            self.model,
+            self.chunks,
+            k,
+            type_filter=type_filter if type_filter else None,
+            expanded_queries=expanded,
+        )
+
         if results:
             context_parts = []
             for i, r in enumerate(results, 1):
@@ -226,22 +295,19 @@ class Assistant:
         else:
             context_block = "No relevant documents found."
 
-        # Construir mensajes para el LLM
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.history)
         messages.append({
             "role": "user",
-            "content": f"Context:\n{context_block}\n\nQuestion: {question}",
+            "content": f"Context:\n{context_block}\n\nQuestion: {clean_question}",
         })
 
-        # Llamar al LLM
         response = self.client.chat.completions.create(
             model=self.llm_model,
             messages=messages,
         )
         answer = response.choices[0].message.content
 
-        # Guardar en historial
         self.history.append({"role": "user", "content": question})
         self.history.append({"role": "assistant", "content": answer})
 

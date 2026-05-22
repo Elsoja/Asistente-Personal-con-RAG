@@ -1,4 +1,7 @@
 Se utilizó IA en los siguiente:
     -Limpieza de código
-    -Elaborar las 3 preguntas con sus respuestas, con la informacion obtenida para los documentos
+    -Elaborar las pruebas del modelo. 
+        Las 3 preguntas y sus respuestas 
+        Preguntas para verificar el filtrado
+        Pregunta para ver lo de expasión de query
     -Perfeccionar el SYSTEM_PROMPT que se le dio al sistema. Para que estuviera mejor estructurado y redactado
